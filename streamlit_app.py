@@ -11,7 +11,9 @@
   - 設定変更後の「再計算」も、アップロード済データを保持したまま実行可能
 """
 from __future__ import annotations
+import calendar
 import io
+import json
 import os
 import re
 import shutil
@@ -20,6 +22,7 @@ import tempfile
 from datetime import datetime, date as _date
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import streamlit as st
 
@@ -606,6 +609,205 @@ def _src_badge(src: str) -> str:
     }.get(src, '⬜ 未読み込み')
 
 
+# =============================================================================
+# safe_metrics.json ローダー
+# -----------------------------------------------------------------------------
+# generate_safe_metrics.py で生成された安全な集計データを読み込む。
+# CRM 売上CSV や統合マスタCSV を Web 上で扱う必要が無くなるため、Streamlit
+# Cloud にも安心してデプロイできる。
+# =============================================================================
+SAFE_METRICS_PATH = _SCRIPT_DIR / 'safe_metrics.json'
+
+
+@st.cache_data(show_spinner=False)
+def _load_safe_metrics_cached(path_str: str, mtime: float) -> dict:
+    del mtime
+    with open(path_str, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def load_safe_metrics() -> dict | None:
+    """safe_metrics.json を mtime キーでキャッシュ読込する。
+    無い場合は None を返す（古い CSV パイプラインへフォールバック）。"""
+    if not SAFE_METRICS_PATH.exists():
+        return None
+    try:
+        return _load_safe_metrics_cached(
+            str(SAFE_METRICS_PATH), os.path.getmtime(SAFE_METRICS_PATH)
+        )
+    except Exception as e:
+        st.warning(f"safe_metrics.json の読込に失敗: {e}")
+        return None
+
+
+# =============================================================================
+# 院長がアップロードした xlsx のプリンタフリーズ対策
+# -----------------------------------------------------------------------------
+# Excel ファイルが「ページレイアウト」「改ページプレビュー」モードで保存されて
+# いると、利用者の PC でファイルを開いた瞬間にデフォルトプリンタへ問い合わせ
+# が走り、UI がフリーズすることがある。アップロードされた xlsx について、
+# load 直前に **全シートの sheet_view を 'normal' に強制** することで完全防止。
+# =============================================================================
+def force_normal_view_on_tempfile(xlsx_path: Path) -> int:
+    """xlsx ファイルの全シートを「標準ビュー」に強制する。
+    Returns: 書き換えたシート数。失敗時は 0 (例外を握りつぶす)。"""
+    try:
+        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+    except Exception:
+        return 0
+    changed = 0
+    try:
+        for ws in wb.worksheets:
+            try:
+                sv = ws.sheet_view
+                if getattr(sv, 'view', None) != 'normal':
+                    sv.view = 'normal'
+                    changed += 1
+                # zoom 系も初期化 (古いビュー設定の残骸を除去)
+                if hasattr(sv, 'zoomScalePageLayoutView'):
+                    sv.zoomScalePageLayoutView = None
+                if hasattr(sv, 'zoomScaleSheetLayoutView'):
+                    sv.zoomScaleSheetLayoutView = None
+            except Exception:
+                pass
+        if changed:
+            wb.save(xlsx_path)
+    except Exception:
+        pass
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return changed
+
+
+# =============================================================================
+# light_analyze — xlsx + safe_metrics.json のみで動作する軽量分析
+# -----------------------------------------------------------------------------
+# 旧 run_full_analysis は ultimate_shift_master.csv を必要としたが、
+# 本関数は **safe_metrics.json から必要人員 / 客単価を取得** することで
+# CSV 依存をゼロにする。アップロードされた xlsx だけで完結する。
+# =============================================================================
+def _build_required_df_from_metrics(
+    target_month: str, safe_metrics: dict,
+) -> pd.DataFrame:
+    """safe_metrics の required_by_dow から、対象月の日別×院別 required_df を生成。"""
+    year, month = map(int, target_month.split('-'))
+    n_days = calendar.monthrange(year, month)[1]
+    wd_jp = '月火水木金土日'
+    rows = []
+    req_map = safe_metrics.get('required_by_dow', {})
+    for day in range(1, n_days + 1):
+        d = datetime(year, month, day)
+        dow_jp = wd_jp[d.weekday()]
+        date_str = d.date().isoformat()
+        for clinic, dow_map in req_map.items():
+            rows.append({
+                'date': date_str,
+                'area': clinic,
+                'day_of_week': dow_jp,
+                'required_staff': int(dow_map.get(dow_jp, 2)),
+                'predicted_visits': 0,
+                'productivity_used': 1.0,
+                'productivity_level': 'safe_metrics_json',
+            })
+    return pd.DataFrame(rows)
+
+
+def light_analyze(
+    target_month: str,
+    folder: str,
+    safe_metrics: dict,
+    movable_whitelist: dict | None = None,
+) -> dict:
+    """safe_metrics.json + 院長アップロードの xlsx だけで動作する分析。
+
+    旧 run_full_analysis 同等の戻り値構造を返すが、master CSV / CRM CSV を
+    一切要求しない。
+    """
+    from shift_optimizer.src.real_data import (
+        load_real_shift_data, find_shift_files,
+    )
+    from shift_optimizer.src.staffing_calculator import StaffingCalculator
+    from shift_optimizer.src.reallocator import Reallocator
+
+    folder_p = Path(folder)
+
+    # ★ プリンタフリーズ対策: アップロードされた xlsx に sheet_view=normal を強制
+    sanitized = 0
+    for xlsx_path in find_shift_files(folder_p):
+        sanitized += force_normal_view_on_tempfile(xlsx_path)
+
+    # 1) xlsx から実データ抽出
+    shift_data = load_real_shift_data(folder_p, target_month)
+    planned = shift_data['planned']
+    leave = shift_data['leave']
+    worked = shift_data['worked']
+    paid_leave = shift_data.get('paid_leave', pd.DataFrame())
+    help_actions = shift_data.get('help_actions', pd.DataFrame())
+    fixed_leave = shift_data.get('fixed_leave', pd.DataFrame())
+
+    if planned.empty:
+        return {
+            'error': (
+                f"{target_month} のシートが各シフト xlsx に見つかりませんでした。"
+                f"対象月のシートが作成されているか確認してください。"
+            ),
+            'missing_areas': shift_data.get('missing_areas', []),
+        }
+
+    # 2) safe_metrics から required_df を生成（master CSV 不要）
+    required_df = _build_required_df_from_metrics(target_month, safe_metrics)
+
+    # 3) 過不足計算
+    calc = StaffingCalculator(min_staff=2, assumptions=[])
+    gap_df = calc.calculate_gap(required_df, planned, leave)
+
+    # 4) 応援アクション（trainee 除外を whitelist で実現）
+    clinic_master = pd.DataFrame([
+        {'院名': c,
+         'エリア': '中央線' if c != '人形町' else '都心'}
+        for c in safe_metrics['clinics']
+    ])
+
+    # trainee_excluded を movable_whitelist から自動的に外す
+    trainee_names = set(safe_metrics.get('trainee_excluded', []))
+    if movable_whitelist and trainee_names:
+        movable_whitelist = {
+            clinic: [n for n in names
+                     if not any(t in str(n) for t in trainee_names)]
+            for clinic, names in movable_whitelist.items()
+        }
+
+    reallocator = Reallocator(clinic_master, [])
+    staff_help_actions = reallocator.suggest_staff_help_actions(
+        gap_df, worked,
+        fixed_leave_df=fixed_leave,
+        movable_whitelist=movable_whitelist,
+    )
+
+    return {
+        'target_month': target_month,
+        'gap_df': gap_df,
+        'staff_help_actions': staff_help_actions,
+        'worked_df': worked,
+        'planned_shifts': planned,
+        'leave_requests': leave,
+        'paid_leave_df': paid_leave,
+        'help_actions_actual_df': help_actions,
+        'fixed_leave_df': fixed_leave,
+        'required_df': required_df,
+        'unit_prices': safe_metrics.get('unit_prices', {}),
+        'missing_areas': shift_data.get('missing_areas', []),
+        'assumptions': [
+            f'必要人員: safe_metrics.json の required_by_dow を使用',
+            f'客単価: safe_metrics.json の unit_prices を使用 (CRM CSV不要)',
+            f'プリンタフリーズ対策: {sanitized} シートを normal ビューへ変換',
+        ],
+    }
+
+
 def _whitelist_to_key(wl: dict | None) -> tuple | None:
     """movable_whitelist を hashable な形に正規化（キャッシュキー用）。"""
     if not wl:
@@ -622,15 +824,35 @@ def _cached_compute_real_shortages(
     master_mtime: float,
     xlsx_mtimes_key: tuple,
     whitelist_key: tuple | None,
+    safe_metrics_mtime: float,
 ):
     """compute_real_shortages の重い部分をキャッシュ。
-    mtime と whitelist が同一なら xlsx + CSV の再パースをスキップする。"""
-    del master_mtime, xlsx_mtimes_key  # cache key only
-    master_csv = Path(folder) / "ultimate_shift_master.csv"
-    # キャッシュキーから元の whitelist dict を再構築
+    mtime / whitelist / safe_metrics の変化でキャッシュ無効化。
+
+    実行モード:
+      - safe_metrics.json があれば → light_analyze (master CSV 不要)
+      - safe_metrics.json が無く master CSV があれば → 旧 run_full_analysis
+    """
+    del master_mtime, xlsx_mtimes_key, safe_metrics_mtime  # cache key only
+
+    # キャッシュキーから movable_whitelist を再構築
     movable_whitelist: dict | None = None
     if whitelist_key:
         movable_whitelist = {k: list(v) for k, v in whitelist_key}
+
+    safe_metrics = load_safe_metrics()
+    if safe_metrics is not None:
+        # ★ ハイブリッド方式: safe_metrics.json + xlsx で完結
+        result = light_analyze(
+            target_month=target_month,
+            folder=folder,
+            safe_metrics=safe_metrics,
+            movable_whitelist=movable_whitelist,
+        )
+        return result
+
+    # 旧パイプライン (master CSV を要求する)
+    master_csv = Path(folder) / "ultimate_shift_master.csv"
     result = run_full_analysis(
         target_month=target_month,
         min_staff=2,
@@ -644,31 +866,41 @@ def _cached_compute_real_shortages(
 
 def compute_real_shortages(target_month: str, folder: str,
                             movable_whitelist: dict | None = None):
-    """実シフトExcel + masterCSV から院別「不足人日」と応援アクションを計算。
-
-    内部で `_cached_compute_real_shortages` を呼ぶことで、ファイルの mtime
-    と whitelist が同一であれば xlsx パース＋集計をスキップする。
+    """xlsx (+ safe_metrics.json) から院別「不足人日」と応援アクションを計算。
 
     Returns: (shortages_dict, gap_df, staff_help_actions_df,
               missing_areas, error_msg, extras)
     """
+    safe_metrics = load_safe_metrics()
+    safe_metrics_mtime = (
+        os.path.getmtime(SAFE_METRICS_PATH) if SAFE_METRICS_PATH.exists() else -1.0
+    )
     master_csv = Path(folder) / "ultimate_shift_master.csv"
-    if not master_csv.exists():
+
+    # safe_metrics.json も master CSV も無いと分析できない
+    if safe_metrics is None and not master_csv.exists():
         return None, None, None, [], (
-            f"ultimate_shift_master.csv が見つかりません: {master_csv}"
+            "safe_metrics.json も ultimate_shift_master.csv も見つかりません。"
+            "管理者に safe_metrics.json をリポジトリへ配置するよう依頼してください。"
         ), {}
+
     try:
         result = _cached_compute_real_shortages(
             target_month=target_month,
             folder=folder,
-            master_mtime=os.path.getmtime(master_csv),
+            master_mtime=(os.path.getmtime(master_csv) if master_csv.exists() else -1.0),
             xlsx_mtimes_key=_shift_xlsx_mtimes_tuple(),
             whitelist_key=_whitelist_to_key(movable_whitelist),
+            safe_metrics_mtime=safe_metrics_mtime,
         )
     except RealDataMissingError as e:
         return None, None, None, [], f"実シフトデータが不足しています:\n{e}", {}
     except Exception as e:
         return None, None, None, [], f"分析中にエラーが発生しました: {e}", {}
+
+    # light_analyze がエラーを返した場合
+    if result.get('error'):
+        return None, None, None, result.get('missing_areas', []), result['error'], {}
 
     # 集計（ベクトル化）— apply(lambda) から clip ベースに変更
     gap_df = result['gap_df'].copy()
@@ -995,41 +1227,41 @@ if _seed_status.get('seeded'):
             icon="✅",
         )
 
-# ---- アップロード (上書き用) ----
-st.sidebar.header("📤 ファイルをアップロード（上書き用）")
-st.sidebar.info(
-    "🛡️ **元のファイルは消えません/上書きされません。**\n\n"
-    "リポジトリ内のデフォルトファイルがあれば自動読込されます。"
-    "ここからアップロードした場合のみ、その分を **一時的に上書き** します。"
+# ---- 院長専用アップロード（シフト Excel のみ） ----
+st.sidebar.header("📤 シフト表をアップロード")
+_safe_metrics_present = SAFE_METRICS_PATH.exists()
+if _safe_metrics_present:
+    st.sidebar.success(
+        "✅ **safe_metrics.json 読込済み**\n\n"
+        "客単価・必要人員・固定スタッフルールは管理者が事前に設定済みです。"
+        "院長は **自院のシフト表 Excel** をドロップするだけで分析できます。"
+    )
+else:
+    st.sidebar.warning(
+        "⚠ safe_metrics.json が見つかりません。\n"
+        "管理者に generate_safe_metrics.py を実行して、リポジトリに"
+        "safe_metrics.json を配置してもらってください。"
+    )
+
+st.sidebar.caption(
+    "🛡️ アップロードされたファイルはサーバの一時メモリにのみ置かれ、"
+    "元のローカルファイルは一切変更されません。"
 )
 
 shift_uploads = st.sidebar.file_uploader(
-    "🗓 シフト表 Excel（5院ぶん）",
+    "🗓 シフト表 Excel（自院分でOK）",
     type=['xlsx'],
     accept_multiple_files=True,
     key='upload_shifts',
     help=(
         "ファイル名の先頭が「【国分寺】」「【武蔵小金井】」「【東小金井】」"
-        "「【坂下】」「【人形町】」のいずれかである .xlsx をまとめてドロップしてください。"
+        "「【坂下】」「【人形町】」のいずれかである .xlsx をドロップ。"
+        "1院だけのアップロードでも分析できます（他院はデフォルト or 未読込として扱い）。"
     ),
-)
-master_upload = st.sidebar.file_uploader(
-    "📊 マスター CSV (任意)",
-    type=['csv'],
-    key='upload_master',
-    help="ultimate_shift_master.csv — デフォルトを一時的に差し替えたい場合",
-)
-crm_upload = st.sidebar.file_uploader(
-    "💰 CRM 売上 CSV (任意)",
-    type=['csv'],
-    key='upload_crm',
-    help="final_analysis_data.csv — デフォルトを一時的に差し替えたい場合",
 )
 
 # アップロードを temp dir に書き出し（同院の seed 済 xlsx は削除して上書き）
-_upload_status = sync_uploads_to_tempdir(
-    shift_uploads, master_upload, crm_upload,
-)
+_upload_status = sync_uploads_to_tempdir(shift_uploads, None, None)
 
 # アップロード後に seed status を再評価して画面側へ反映
 _seed_status = seed_defaults_if_present()
@@ -1037,15 +1269,11 @@ st.session_state['_seed_status_cache'] = _seed_status
 
 # サイドバー: 現在の読込状況（コンパクト表示）
 st.sidebar.divider()
-st.sidebar.markdown("**📋 現在の読込状況**")
+st.sidebar.markdown("**📋 シフト表の認識状況**")
 for c in CLINIC_FILE_PREFIX:
-    st.sidebar.caption(f"{_src_badge(_seed_status['shifts'].get(c, 'absent'))} {c}")
-st.sidebar.caption(
-    f"{_src_badge(_seed_status['master'])} マスタ CSV"
-)
-st.sidebar.caption(
-    f"{_src_badge(_seed_status['crm'])} CRM CSV"
-)
+    st.sidebar.caption(
+        f"{_src_badge(_seed_status['shifts'].get(c, 'absent'))} {c}"
+    )
 
 st.sidebar.divider()
 st.sidebar.markdown("### 📅 対象月を選択")
@@ -1137,10 +1365,7 @@ if st.sidebar.button(
     _reset_analysis_state()
     _clear_streamlit_caches()
     # アップロードウィジェットのキーもリセット
-    for k in [
-        'upload_shifts', 'upload_master', 'upload_crm',
-        'movable_whitelist',
-    ]:
+    for k in ['upload_shifts', 'movable_whitelist']:
         st.session_state.pop(k, None)
     for k in list(st.session_state.keys()):
         if k.startswith('ms_help_'):
@@ -1239,26 +1464,40 @@ st.divider()
 #  なければ DEFAULT_DATA_DIR のデフォルトファイルが自動使用される。
 # =====================================================================
 seed_status = st.session_state.get('_seed_status_cache', {})
+_safe_metrics_for_status = load_safe_metrics()
 
 
 with st.container(border=True):
     st.markdown("### 📊 データ読み込み状況")
-    sub_cols = st.columns(7)
-    sub_cols[0].caption("**マスタ CSV**")
-    sub_cols[0].markdown(_src_badge(seed_status.get('master', 'absent')))
-    sub_cols[1].caption("**CRM CSV**")
-    sub_cols[1].markdown(_src_badge(seed_status.get('crm', 'absent')))
+    sub_cols = st.columns(6)
+    # safe_metrics.json (管理者が事前生成・リポジトリ同梱)
+    sub_cols[0].caption("**設定 JSON**")
+    if _safe_metrics_for_status:
+        sub_cols[0].markdown("🟢 読込済み")
+        sub_cols[0].caption(
+            f"生成: {_safe_metrics_for_status.get('generated_at', '?')[:10]}"
+        )
+    else:
+        sub_cols[0].markdown("⬜ 未配置")
+    # 5院シフト xlsx
     shift_status = seed_status.get('shifts', {}) or {}
     for i, clinic in enumerate(CLINIC_FILE_PREFIX):
-        sub_cols[i + 2].caption(f"**{clinic}**")
-        sub_cols[i + 2].markdown(_src_badge(shift_status.get(clinic, 'absent')))
+        sub_cols[i + 1].caption(f"**{clinic}**")
+        sub_cols[i + 1].markdown(_src_badge(shift_status.get(clinic, 'absent')))
 
     # 凡例
     st.caption(
         "凡例: 🟢 リポジトリ内のデフォルトファイル使用 ／ "
         "🔵 サイドバーでアップロードされたファイルで上書き中 ／ "
-        "⬜ 未読み込み（サイドバーからアップロードしてください）"
+        "⬜ 未読み込み（サイドバーからシフト Excel をアップロードしてください）"
     )
+    # safe_metrics.json から客単価を表示
+    if _safe_metrics_for_status:
+        ups = _safe_metrics_for_status.get('unit_prices', {})
+        st.caption(
+            "💰 **客単価 (safe_metrics.json より)**: "
+            + " / ".join(f"{c} ¥{int(ups.get(c, 6000)):,}" for c in CLINIC_FILE_PREFIX)
+        )
 
 st.divider()
 
@@ -1489,10 +1728,19 @@ if _trigger_analysis and month_valid:
     crm_path = os.path.join(folder, "final_analysis_data.csv")
     master_path = os.path.join(folder, "ultimate_shift_master.csv")
 
+    # safe_metrics.json が利用可能か事前判定
+    _safe_metrics_dict = load_safe_metrics()
+    _have_safe_metrics = _safe_metrics_dict is not None
+
     # 必須ファイルの存在チェック（アップロード未完了の防止）
     missing_required: list[str] = []
-    if not os.path.exists(master_path):
-        missing_required.append("ultimate_shift_master.csv (マスター CSV)")
+
+    # safe_metrics があれば master CSV は不要、無ければ必要
+    if not _have_safe_metrics and not os.path.exists(master_path):
+        missing_required.append(
+            "safe_metrics.json または ultimate_shift_master.csv"
+        )
+
     n_shift_xlsx = sum(
         1 for c in CLINIC_FILE_PREFIX
         if (lambda x: x is not None and x.exists())(find_shift_xlsx(c))
@@ -1502,39 +1750,37 @@ if _trigger_analysis and month_valid:
 
     if missing_required:
         st.error(
-            "⚠ **アップロードが不足しています**\n\n"
-            "下記のファイルを **「📤 ファイルをアップロード」** "
-            "セクションでアップロードしてから、再度「▶ 分析する」を押してください:\n\n"
+            "⚠ **必要なデータが不足しています**\n\n"
             + "\n".join(f"- ❌ {f}" for f in missing_required)
+            + "\n\nサイドバーの **「📤 シフト表をアップロード」** から"
+              "ファイルを選択してください。"
         )
     else:
-        # CRM ファイルは任意。あれば客単価算出に使用、なければ既定 ¥6,000
-        crm_mtime = "未アップロード（既定 ¥6,000 で計算）"
-        if os.path.exists(crm_path):
-            try:
-                crm_mtime = datetime.fromtimestamp(
-                    os.path.getmtime(crm_path)
-                ).strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                crm_mtime = "不明"
-
-        with st.spinner(f"{target_month} を最新ファイルから読み直して分析中…"):
-            # ① CRM 売上CSV から客単価（未アップロードなら既定値）
-            if os.path.exists(crm_path):
-                unit_prices, err = calculate_unit_prices(crm_path)
-                if err:
-                    st.warning(
-                        f"CRM 読み込み失敗 — 客単価を既定 ¥6,000 にフォールバック: {err}"
-                    )
-                    unit_prices = {c: 6000 for c in CLINIC_FILE_PREFIX}
-                    err = None
-            else:
+        # 客単価: safe_metrics.json 優先 → 旧 CRM CSV → 既定¥6,000
+        if _have_safe_metrics:
+            unit_prices = dict(_safe_metrics_dict.get('unit_prices', {}))
+            for c in CLINIC_FILE_PREFIX:
+                unit_prices.setdefault(c, 6000)
+            crm_mtime = (
+                f"safe_metrics.json ({_safe_metrics_dict.get('generated_at', '?')})"
+            )
+        elif os.path.exists(crm_path):
+            unit_prices, err_up = calculate_unit_prices(crm_path)
+            if err_up:
+                st.warning(
+                    f"CRM 読み込み失敗 → 既定 ¥6,000: {err_up}"
+                )
                 unit_prices = {c: 6000 for c in CLINIC_FILE_PREFIX}
-                err = None
+            crm_mtime = datetime.fromtimestamp(
+                os.path.getmtime(crm_path)
+            ).strftime("%Y-%m-%d %H:%M")
+        else:
+            unit_prices = {c: 6000 for c in CLINIC_FILE_PREFIX}
+            crm_mtime = "未指定（既定 ¥6,000 で計算）"
 
-            if err:
-                st.error(err)
-            else:
+        with st.spinner(f"{target_month} を分析中…"):
+            err = None
+            if True:
                 # ② シフト xlsx + masterCSV から実「不足人日」と応援指示を算出
                 # 院長の選択した「ヘルプ要員」白リストを反映
                 _wl = st.session_state.get('movable_whitelist') or {}
