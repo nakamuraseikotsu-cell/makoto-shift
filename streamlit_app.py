@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
-"""シフト最適化 Web パネル（Streamlit版）
+"""シフト最適化 Web パネル（Streamlit Cloud デプロイ版）
 
 主な特徴:
-  - サイドバーで対象月を選び、「▶ ◯◯-◯◯ を分析する」プライマリーボタンで実行
-  - 画面右上に対象月バナー、本文ヘッダーにも対象月を反映
-  - 各院名はクリッカブル → 対応する シフト表 (.xlsx) を即時オープン
-  - データソースは Google Drive 優先 → ローカル crm_scraper フォルダにフォールバック
+  - サイドバーで対象月を選択
+  - 画面上から **シフト表 Excel / マスター CSV / CRM CSV** を直接アップロード
+    （ローカルパス・Google Drive 等への依存はゼロ）
+  - アップロードされたファイルはサーバ側の **セッション専用 temp dir** にのみ
+    保存され、元のローカルファイルには一切影響しない
+  - 結果は **Excel (.xlsx, 複数シート) または CSV** でダウンロード可能
+  - 設定変更後の「再計算」も、アップロード済データを保持したまま実行可能
 """
 from __future__ import annotations
+import io
 import os
 import re
+import shutil
 import sys
+import tempfile
 from datetime import datetime, date as _date
 from pathlib import Path
 
@@ -26,18 +32,12 @@ if str(_SCRIPT_DIR) not in sys.path:
 from shift_optimizer.main import (  # noqa: E402
     run_full_analysis, RealDataMissingError,
 )
-from shift_optimizer.src.real_data import (  # noqa: E402
-    force_normal_view_xml_all,
-)
 from shift_optimizer.src.constants import IMMOVABLE_STAFF  # noqa: E402
 
 
 # ==========================================
 # 設定
 # ==========================================
-DRIVE_FOLDER_PATH = r"G:\マイドライブ\シフト最適化プロジェクト"
-LOCAL_FALLBACK_PATH = str(_SCRIPT_DIR)
-
 # 1日あたりの施術対応枠（人）
 CAPACITY_PER_DAY = {
     "国分寺": 12,
@@ -345,36 +345,52 @@ def calculate_unit_prices(crm_path):
     return _cached_unit_prices(crm_path, os.path.getmtime(crm_path))
 
 
+# =============================================================================
+# セッション専用 temp dir 管理（アップロードファイルの一時保存先）
+# -----------------------------------------------------------------------------
+# Streamlit Cloud では各ユーザのブラウザセッション毎に独立した temp dir を
+# 生成する。アップロードされたシフト xlsx / マスター CSV / CRM CSV はこの
+# ディレクトリにのみ書き出され、元のローカルファイルは一切変更されない。
+# セッション終了時（ブラウザを閉じる等）に OS が自動的にクリーンアップする。
+# =============================================================================
 def get_data_folder() -> str:
-    """データソース：Driveが見えればDrive、なければスクリプト隣のフォルダ"""
-    if os.path.exists(DRIVE_FOLDER_PATH):
-        return DRIVE_FOLDER_PATH
-    return LOCAL_FALLBACK_PATH
+    """セッション専用 temp dir のパスを返す（無ければ作成）。"""
+    if '_upload_tempdir' not in st.session_state:
+        st.session_state['_upload_tempdir'] = tempfile.mkdtemp(
+            prefix='shift_session_'
+        )
+    return st.session_state['_upload_tempdir']
+
+
+def reset_session_tempdir() -> None:
+    """アップロード済みファイルを全削除し、temp dir を破棄→再作成。"""
+    old = st.session_state.pop('_upload_tempdir', None)
+    if old and os.path.isdir(old):
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+        except Exception:
+            pass
+    st.session_state.pop('_written_file_ids', None)
 
 
 def find_shift_xlsx(clinic_name: str) -> Path | None:
-    """院名から対応するシフト表 .xlsx を検索。
-    `glob` は軽い操作なのでキャッシュしない（ファイル追加・改名へ即追従）。"""
+    """院名からアップロード済シフト xlsx を検索する。"""
     prefix = CLINIC_FILE_PREFIX.get(clinic_name)
     if not prefix:
         return None
-    for root in (Path(DRIVE_FOLDER_PATH), Path(LOCAL_FALLBACK_PATH)):
-        if not root.exists():
-            continue
-        candidates = sorted(root.glob(f'{prefix}*.xlsx'))
-        # 「シフト」を含むものを優先
-        for p in candidates:
-            if 'シフト' in p.name:
-                return p
-        if candidates:
-            return candidates[0]
-    return None
+    folder = Path(get_data_folder())
+    if not folder.exists():
+        return None
+    candidates = sorted(folder.glob(f'{prefix}*.xlsx'))
+    for p in candidates:
+        if 'シフト' in p.name:
+            return p
+    return candidates[0] if candidates else None
 
 
-def collect_shift_xlsx_mtimes(folder: str) -> dict:
-    """各院シフト xlsx の最終更新時刻 (表示用文字列)。
-    `os.path.getmtime` は ms オーダーで高速なのでキャッシュしない。"""
-    del folder  # find_shift_xlsx 内で DRIVE/LOCAL を内部解決
+def collect_shift_xlsx_mtimes(folder: str | None = None) -> dict:
+    """各院シフト xlsx の最終更新時刻（表示用文字列）。"""
+    del folder  # find_shift_xlsx が session temp dir を内部解決する
     out = {}
     for clinic in CLINIC_FILE_PREFIX:
         xlsx = find_shift_xlsx(clinic)
@@ -391,8 +407,7 @@ def collect_shift_xlsx_mtimes(folder: str) -> dict:
 
 
 def _shift_xlsx_mtimes_tuple() -> tuple:
-    """キャッシュキー用: (clinic, mtime_float) のソート済みタプル。
-    どれか1院でも xlsx が更新されれば自動でキャッシュ無効化される。"""
+    """キャッシュキー用: (clinic, mtime_float) のソート済みタプル。"""
     items = []
     for clinic in CLINIC_FILE_PREFIX:
         xlsx = find_shift_xlsx(clinic)
@@ -404,6 +419,72 @@ def _shift_xlsx_mtimes_tuple() -> tuple:
         else:
             items.append((clinic, -1.0))
     return tuple(items)
+
+
+# =============================================================================
+# アップロードファイルを temp dir に同期するユーティリティ
+# -----------------------------------------------------------------------------
+# Streamlit の UploadedFile オブジェクトは session_state にまたがって永続化
+# されるが、`run_full_analysis` は **ディスク上の xlsx パス** を必要とする。
+# そこで temp dir に書き出しておく。`file_id` を追跡して、同じファイルなら
+# 二度目以降は書き直さない（無駄な I/O を避ける）。
+# =============================================================================
+def _file_id_of(uploaded) -> tuple:
+    """UploadedFile を一意に識別するキー（書き直し回避用）。"""
+    return (
+        getattr(uploaded, 'file_id', None) or uploaded.name,
+        uploaded.name,
+        uploaded.size,
+    )
+
+
+def sync_uploads_to_tempdir(
+    shift_uploads: list | None,
+    master_upload,
+    crm_upload,
+) -> dict:
+    """アップロードを temp dir に同期する。既に書き出し済みならスキップ。"""
+    tmpdir = Path(get_data_folder())
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    written_ids = st.session_state.setdefault('_written_file_ids', set())
+
+    status: dict = {'shifts': [], 'master': None, 'crm': None}
+
+    from shift_optimizer.src.real_data import detect_area_from_filename
+
+    for uf in (shift_uploads or []):
+        fid = _file_id_of(uf)
+        target = tmpdir / uf.name
+        if fid not in written_ids or not target.exists():
+            target.write_bytes(uf.getbuffer())
+            written_ids.add(fid)
+        area = detect_area_from_filename(uf.name)
+        status['shifts'].append({
+            'name': uf.name, 'area': area,
+            'size': uf.size, 'path': str(target),
+        })
+
+    if master_upload is not None:
+        fid = _file_id_of(master_upload)
+        target = tmpdir / 'ultimate_shift_master.csv'
+        if fid not in written_ids or not target.exists():
+            target.write_bytes(master_upload.getbuffer())
+            written_ids.add(fid)
+        status['master'] = {'name': master_upload.name,
+                            'size': master_upload.size,
+                            'path': str(target)}
+
+    if crm_upload is not None:
+        fid = _file_id_of(crm_upload)
+        target = tmpdir / 'final_analysis_data.csv'
+        if fid not in written_ids or not target.exists():
+            target.write_bytes(crm_upload.getbuffer())
+            written_ids.add(fid)
+        status['crm'] = {'name': crm_upload.name,
+                         'size': crm_upload.size,
+                         'path': str(target)}
+
+    return status
 
 
 def _whitelist_to_key(wl: dict | None) -> tuple | None:
@@ -673,6 +754,74 @@ def _hr_style_highlight(df: pd.DataFrame):
 
 
 # ==========================================
+# 結果ダウンロード（Excel/CSV）生成
+# ==========================================
+def build_results_xlsx_bytes(
+    analysis: dict,
+    hr_df: pd.DataFrame | None,
+    capacity_per_day: dict,
+) -> bytes:
+    """分析結果から複数シートの Excel ファイルを生成して bytes で返す。
+    利用者が Excel で開いて手直しできる形式（行・列の編集自由）。"""
+    buf = io.BytesIO()
+    target_month = analysis.get('target_month', '')
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        # シート1: 概要
+        shortages = analysis.get('shortages', {}) or {}
+        surpluses = analysis.get('surpluses', {}) or {}
+        unit_prices = analysis.get('unit_prices', {}) or {}
+        rows = []
+        for c in shortages:
+            up = unit_prices.get(c) or 6000
+            if pd.isna(up):
+                up = 6000
+            cap = capacity_per_day.get(c, 12)
+            short = int(shortages.get(c, 0))
+            rows.append({
+                '院': c, '不足人日': short, '余剰人日': int(surpluses.get(c, 0)),
+                '1日対応枠': cap, '客単価': int(up),
+                '機会損失額': short * cap * int(up),
+            })
+        pd.DataFrame(rows).to_excel(writer, sheet_name='概要', index=False)
+
+        # シート2-6: 詳細データ
+        sheets = [
+            ('応援アクション指示', 'staff_help_actions'),
+            ('過不足詳細',         'gap_df'),
+            ('有給取得',           'paid_leave_df'),
+            ('他院ヘルプ実績',     'help_actions_actual_df'),
+            ('固定休',             'fixed_leave_df'),
+        ]
+        for sheet_name, key in sheets:
+            df = analysis.get(key)
+            if isinstance(df, pd.DataFrame) and len(df) > 0:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # シート7: 人事サマリ
+        if isinstance(hr_df, pd.DataFrame) and len(hr_df) > 0:
+            hr_df.to_excel(writer, sheet_name='人事サマリ', index=False)
+
+        # シート8: メタ情報
+        meta = pd.DataFrame([
+            {'項目': '対象月', '値': target_month},
+            {'項目': '分析実行時刻', '値':
+                analysis.get('analyzed_at', '')},
+            {'項目': '機会損失合計', '値':
+                sum(r['機会損失額'] for r in rows)},
+        ])
+        meta.to_excel(writer, sheet_name='メタ情報', index=False)
+
+    return buf.getvalue()
+
+
+def df_to_csv_bytes(df: pd.DataFrame | None) -> bytes:
+    """DataFrame を UTF-8 BOM 付き CSV bytes に変換（Excel で文字化けしない）。"""
+    if df is None or len(df) == 0:
+        return b''
+    return df.to_csv(index=False).encode('utf-8-sig')
+
+
+# ==========================================
 # 日付連動の運用スケジュール警告
 # ==========================================
 def render_schedule_alert(today: _date | None = None) -> None:
@@ -708,15 +857,31 @@ def render_schedule_alert(today: _date | None = None) -> None:
 # ==========================================
 # サイドバー
 # ==========================================
-st.sidebar.header("📁 データソース")
+# 現在のアップロード状況をサイドバーに集約表示
 data_folder = get_data_folder()
-if os.path.exists(DRIVE_FOLDER_PATH):
-    st.sidebar.success(
-        f"✓ Googleドライブを参照\n\n`{DRIVE_FOLDER_PATH}`"
+_status_shifts = []
+for _c in CLINIC_FILE_PREFIX:
+    _x = find_shift_xlsx(_c)
+    _status_shifts.append((_c, bool(_x and _x.exists())))
+_uploaded_n = sum(1 for _, ok in _status_shifts if ok)
+_master_ok = (Path(data_folder) / 'ultimate_shift_master.csv').exists()
+_crm_ok = (Path(data_folder) / 'final_analysis_data.csv').exists()
+
+st.sidebar.header("📤 アップロード状況")
+if _uploaded_n == 0 and not _master_ok:
+    st.sidebar.info(
+        "ファイル未アップロード\n\n"
+        "メイン画面の **「📤 ファイルをアップロード」** "
+        "セクションでシフト表を選択してください。"
     )
 else:
-    st.sidebar.info(
-        f"📂 ローカルフォルダを参照中\n\n`{LOCAL_FALLBACK_PATH}`"
+    for clinic, ok in _status_shifts:
+        st.sidebar.caption(f"{'✅' if ok else '⬜'} {clinic}")
+    st.sidebar.caption(
+        f"{'✅' if _master_ok else '⬜'} ultimate_shift_master.csv"
+    )
+    st.sidebar.caption(
+        f"{'✅' if _crm_ok else '⬜'} final_analysis_data.csv (任意)"
     )
 
 st.sidebar.divider()
@@ -793,49 +958,32 @@ if 'analysis' in st.session_state:
         )
         st.rerun()
 
-# ★ プリンタ通信フリーズ対策ボタン（XML安全モード）
+# 🗑 アップロードクリア（次の利用者のためにセッションをリセット）
 st.sidebar.divider()
-st.sidebar.markdown("### 🛡️ プリンタ通信フリーズ対策")
+st.sidebar.markdown("### 🗑 アップロード/セッションのリセット")
 st.sidebar.caption(
-    "Excelで開いた瞬間にプリンタへ接続して固まる現象を回避するため、"
-    "各シフトxlsx内の **表示モード** を「標準ビュー」に強制します。"
-    "**XMLレベルで sheet_view のみ書き換え** → 数式・cached value・"
-    "書式・コメント等は一切変更しません。"
+    "アップロード済みファイルをサーバ側のメモリから削除し、最初の状態に戻します。"
+    "**元のローカルファイルには影響しません**。"
 )
-sanitize_clicked = st.sidebar.button(
-    "🛡️ 全Excelを「標準ビュー」に強制（XML安全）",
+if st.sidebar.button(
+    "🗑 アップロードを全部クリア",
     use_container_width=True,
-    help="5院のシフト xlsx すべてに対し、pageBreakPreview / pageLayout の"
-         "シートを 'normal' に書き換えます。\n"
-         "※ 読込時にも自動で同処理が走るため、通常は不要です。",
-)
-if sanitize_clicked:
-    folder = get_data_folder()
-    with st.spinner(f"{folder} のシフトxlsxを XMLレベルで正規化中…"):
-        results = force_normal_view_xml_all(Path(folder))
-    ok = [r for r in results if r['status'] == 'ok']
-    noop = [r for r in results if r['status'] == 'noop']
-    locked = [r for r in results if r['status'] == 'locked']
-    err = [r for r in results if r['status'] == 'error']
-    if ok:
-        total = sum(r['changed'] for r in ok)
-        st.sidebar.success(
-            f"✓ {len(ok)} ファイル / 計 {total} シートを normal に変更"
-        )
-    if noop:
-        st.sidebar.info(
-            f"{len(noop)} ファイルは既に標準ビューでした（変更不要）"
-        )
-    if locked:
-        for r in locked:
-            st.sidebar.warning(
-                f"🔒 {Path(r['path']).name} は Excel で開かれているためスキップ"
-            )
-    if err:
-        for r in err:
-            st.sidebar.error(f"⚠ {Path(r['path']).name}: {r['error']}")
-    if not (ok or noop or locked or err):
-        st.sidebar.warning("対象 xlsx が見つかりませんでした")
+    help="このボタンを押すと、アップロードしたファイルがサーバ側から消去されます",
+):
+    reset_session_tempdir()
+    _reset_analysis_state()
+    _clear_streamlit_caches()
+    # アップロードウィジェットのキーもリセット
+    for k in [
+        'upload_shifts', 'upload_master', 'upload_crm',
+        'movable_whitelist',
+    ]:
+        st.session_state.pop(k, None)
+    for k in list(st.session_state.keys()):
+        if k.startswith('ms_help_'):
+            st.session_state.pop(k, None)
+    st.toast("🗑 アップロードをすべてクリアしました", icon="🧹")
+    st.rerun()
 
 # ★ デバッグ用：session_state 診断パネル
 st.sidebar.divider()
@@ -905,6 +1053,100 @@ with header_col2:
 # 日付連動の運用スケジュール警告（最上段に表示）
 # ==========================================
 render_schedule_alert()
+
+st.divider()
+
+
+# =====================================================================
+# 📤 ファイルアップロード
+# ---------------------------------------------------------------------
+# ローカルパスや Google Drive への依存を廃止し、すべてブラウザから
+# アップロードされたファイルで分析する。
+#  - シフト Excel: 5院ぶん（必須）
+#  - ultimate_shift_master.csv: 過去患者・スタッフ実績の集計（必須）
+#  - final_analysis_data.csv: CRM 売上データ（任意 — 客単価算出に使用）
+#
+# ★ 重要: アップロードされたファイルは **サーバの一時ディレクトリにのみ**
+#   保存され、元のローカルファイルには一切影響しない。
+# =====================================================================
+with st.container(border=True):
+    st.markdown("### 📤 ファイルをアップロード")
+
+    # 安心メッセージ（常時可視・大きめ）
+    st.info(
+        "ℹ️ **ここにファイルをドロップしても、元のファイルが消えたり"
+        "上書きされることはありませんのでご安心ください。**\n\n"
+        "アップロードされたファイルはサーバ側の一時メモリに置かれ、"
+        "ブラウザを閉じると自動的に破棄されます。"
+        "PC 内の元ファイルは一切変更されません。",
+        icon="🛡️",
+    )
+
+    upload_col1, upload_col2 = st.columns([2, 1])
+
+    with upload_col1:
+        shift_uploads = st.file_uploader(
+            "**🗓 シフト表 Excel（5院ぶん）**",
+            type=['xlsx'],
+            accept_multiple_files=True,
+            key='upload_shifts',
+            help=(
+                "ファイル名の先頭が「【国分寺】」「【武蔵小金井】」"
+                "「【東小金井】」「【坂下】」「【人形町】」のいずれかである "
+                ".xlsx ファイルをまとめてドロップしてください。"
+            ),
+        )
+
+        sub_col1, sub_col2 = st.columns(2)
+        with sub_col1:
+            master_upload = st.file_uploader(
+                "**📊 マスター CSV** (必須)",
+                type=['csv'],
+                key='upload_master',
+                help=(
+                    "ultimate_shift_master.csv（過去患者・天気・"
+                    "スタッフ実績の集計データ）"
+                ),
+            )
+        with sub_col2:
+            crm_upload = st.file_uploader(
+                "**💰 CRM 売上 CSV** (任意)",
+                type=['csv'],
+                key='upload_crm',
+                help=(
+                    "final_analysis_data.csv（院別の客単価算出に使用）。"
+                    "未指定なら一律 ¥6,000 で計算します。"
+                ),
+            )
+
+    # アップロードを temp dir に書き出し
+    upload_status = sync_uploads_to_tempdir(
+        shift_uploads, master_upload, crm_upload,
+    )
+
+    with upload_col2:
+        st.markdown("**📋 認識状況**")
+        # 各院の認識結果
+        clinic_status_lines = []
+        recognized = {s['area']: s for s in upload_status['shifts'] if s['area']}
+        unrecognized = [s for s in upload_status['shifts'] if not s['area']]
+        for clinic in CLINIC_FILE_PREFIX:
+            if clinic in recognized:
+                clinic_status_lines.append(f"✅ **{clinic}**")
+            else:
+                clinic_status_lines.append(f"⬜ {clinic}")
+        clinic_status_lines.append(
+            f"{'✅' if upload_status['master'] else '⬜'} master CSV"
+        )
+        clinic_status_lines.append(
+            f"{'✅' if upload_status['crm'] else '⬜'} CRM CSV (任意)"
+        )
+        for line in clinic_status_lines:
+            st.markdown(f"- {line}")
+        if unrecognized:
+            st.caption(
+                f"⚠ プレフィックス未認識: {', '.join(s['name'] for s in unrecognized)}"
+            )
 
 st.divider()
 
@@ -1133,26 +1375,51 @@ _trigger_analysis = analyze_clicked or _pending_flag
 if _trigger_analysis and month_valid:
     folder = get_data_folder()
     crm_path = os.path.join(folder, "final_analysis_data.csv")
+    master_path = os.path.join(folder, "ultimate_shift_master.csv")
 
-    if not os.path.exists(crm_path):
+    # 必須ファイルの存在チェック（アップロード未完了の防止）
+    missing_required: list[str] = []
+    if not os.path.exists(master_path):
+        missing_required.append("ultimate_shift_master.csv (マスター CSV)")
+    n_shift_xlsx = sum(
+        1 for c in CLINIC_FILE_PREFIX
+        if (lambda x: x is not None and x.exists())(find_shift_xlsx(c))
+    )
+    if n_shift_xlsx == 0:
+        missing_required.append("シフト Excel (1院以上)")
+
+    if missing_required:
         st.error(
-            f"⚠ **CRMデータ（final_analysis_data.csv）が見つかりません**\n\n"
-            f"検索場所:\n```\n{folder}\n```\n\n"
-            f"`final_analysis_data.csv` を上記のフォルダに配置してから"
-            f"再度実行してください。"
+            "⚠ **アップロードが不足しています**\n\n"
+            "下記のファイルを **「📤 ファイルをアップロード」** "
+            "セクションでアップロードしてから、再度「▶ 分析する」を押してください:\n\n"
+            + "\n".join(f"- ❌ {f}" for f in missing_required)
         )
     else:
-        # CRM ファイルの更新日時を取得（最新性確認用）
-        try:
-            crm_mtime = datetime.fromtimestamp(
-                os.path.getmtime(crm_path)
-            ).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            crm_mtime = "不明"
+        # CRM ファイルは任意。あれば客単価算出に使用、なければ既定 ¥6,000
+        crm_mtime = "未アップロード（既定 ¥6,000 で計算）"
+        if os.path.exists(crm_path):
+            try:
+                crm_mtime = datetime.fromtimestamp(
+                    os.path.getmtime(crm_path)
+                ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                crm_mtime = "不明"
 
         with st.spinner(f"{target_month} を最新ファイルから読み直して分析中…"):
-            # ① CRM 売上CSV から客単価
-            unit_prices, err = calculate_unit_prices(crm_path)
+            # ① CRM 売上CSV から客単価（未アップロードなら既定値）
+            if os.path.exists(crm_path):
+                unit_prices, err = calculate_unit_prices(crm_path)
+                if err:
+                    st.warning(
+                        f"CRM 読み込み失敗 — 客単価を既定 ¥6,000 にフォールバック: {err}"
+                    )
+                    unit_prices = {c: 6000 for c in CLINIC_FILE_PREFIX}
+                    err = None
+            else:
+                unit_prices = {c: 6000 for c in CLINIC_FILE_PREFIX}
+                err = None
+
             if err:
                 st.error(err)
             else:
@@ -1401,30 +1668,13 @@ if 'analysis' in st.session_state:
                 unsafe_allow_html=True,
             )
 
-            # ★ 院名クリッカブル → シフト表を開く
-            if st.button(
-                f"🏢 {clinic}",
-                key=f"open_xlsx_{clinic}",
-                use_container_width=True,
-                help=f"クリックで {clinic} のシフト表（Excel）を開きます",
-            ):
-                xlsx_path = find_shift_xlsx(clinic)
-                if xlsx_path and xlsx_path.exists():
-                    try:
-                        os.startfile(str(xlsx_path))
-                        st.toast(
-                            f"📂 {clinic} のシフト表を開きました",
-                            icon="✅",
-                        )
-                    except Exception as e:
-                        st.error(f"⚠ 開けませんでした: {e}")
-                else:
-                    st.warning(
-                        f"⚠ **{clinic}** のシフト表（xlsx）が "
-                        f"見つかりませんでした。\n\n"
-                        f"検索パターン: `{CLINIC_FILE_PREFIX.get(clinic)}*.xlsx`\n"
-                        f"検索場所: Google ドライブ → ローカル"
-                    )
+            # 院名表示（Streamlit Cloud では os.startfile() は使えないため
+            # クリッカブル → Excel 起動 は廃止。代わりに院別のヘルプ要請数を表示）
+            st.markdown(
+                f"<div style='text-align:center; font-weight:bold; "
+                f"font-size:1.05em; margin:6px 0;'>🏢 {clinic}</div>",
+                unsafe_allow_html=True,
+            )
 
             # 院ごとの指標
             st.caption(f"{capacity} 枠/日 × 単価 {int(unit_price):,} 円")
@@ -1557,17 +1807,114 @@ if 'analysis' in st.session_state:
             use_container_width=True,
         )
 
+    # ============================================================
+    # 📦 結果の一括ダウンロード（手直し可能な Excel / CSV 形式）
+    # ------------------------------------------------------------
+    # 利用者が表計算ソフトで開いて自由に編集できるよう、PDF ではなく
+    # Excel (.xlsx, 複数シート) と CSV (各データ別) で提供する。
+    # ============================================================
+    st.markdown("---")
+    st.markdown("## 📦 結果をダウンロード（手直し可能な形式）")
+    st.caption(
+        "下記からファイルを取得して、Excel / 表計算ソフトで開いて自由に編集できます。"
+        "用途に合わせて Excel（複数シート一括）または CSV（個別）を選んでください。"
+    )
+
+    dl_data_full = {
+        'target_month': displayed_month,
+        'shortages': data.get('shortages', {}),
+        'surpluses': data.get('surpluses', {}),
+        'unit_prices': data.get('unit_prices', {}),
+        'staff_help_actions': data.get('staff_help_actions'),
+        'gap_df': data.get('gap_df'),
+        'paid_leave_df': data.get('paid_leave_df'),
+        'help_actions_actual_df': data.get('help_actions_actual_df'),
+        'fixed_leave_df': data.get('fixed_leave_df'),
+        'analyzed_at': data.get('analyzed_at', ''),
+    }
+
+    dl_col1, dl_col2 = st.columns([1, 1])
+    with dl_col1:
+        st.markdown("**🟢 まとめてダウンロード（推奨）**")
+        try:
+            xlsx_bytes = build_results_xlsx_bytes(
+                dl_data_full, hr_df if not hr_df.empty else None,
+                CAPACITY_PER_DAY,
+            )
+            st.download_button(
+                "📥 全結果を Excel (.xlsx) でダウンロード",
+                data=xlsx_bytes,
+                file_name=f"shift_analysis_{displayed_month}.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                use_container_width=True,
+                type="primary",
+                help=(
+                    "概要・応援アクション・過不足詳細・人事サマリ等が "
+                    "1 つの xlsx に複数シートで入ります（編集自由）。"
+                ),
+            )
+        except Exception as e:
+            st.warning(f"Excel ファイル生成に失敗: {e}")
+
+    with dl_col2:
+        st.markdown("**🔵 個別ダウンロード（CSV）**")
+        st.download_button(
+            "📥 応援アクション指示 (CSV)",
+            data=df_to_csv_bytes(data.get('staff_help_actions')),
+            file_name=f"staff_help_actions_{displayed_month}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=(
+                data.get('staff_help_actions') is None
+                or len(data.get('staff_help_actions', [])) == 0
+            ),
+        )
+        st.download_button(
+            "📥 過不足詳細 (CSV)",
+            data=df_to_csv_bytes(data.get('gap_df')),
+            file_name=f"gap_detail_{displayed_month}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=(
+                data.get('gap_df') is None
+                or len(data.get('gap_df', [])) == 0
+            ),
+        )
+        st.download_button(
+            "📥 人事・労務サマリ (CSV)",
+            data=df_to_csv_bytes(hr_df if not hr_df.empty else None),
+            file_name=f"hr_summary_{displayed_month}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=hr_df.empty,
+        )
+
+    st.caption(
+        "💡 **再計算したいときは**: 設定（対象月・ヘルプ要員選択など）を変更してから "
+        "もう一度「▶ 分析する」を押してください。アップロード済みのファイルは"
+        "保持されているので、再アップロードは不要です。"
+    )
+
 else:
     # 未実行時の案内
     st.info(
-        "👈 左サイドバーから **対象月** を選んで、"
-        f" **「▶ {target_month} を分析する」** ボタンを押してください。"
+        "👋 ご利用にあたって\n\n"
+        "1. 上の **「📤 ファイルをアップロード」** で 5 院ぶんのシフト Excel と"
+        " マスター CSV を選択してください\n"
+        "2. サイドバーで **対象月** を選んで、"
+        f" **「▶ {target_month} を分析する」** ボタンを押してください\n"
+        "3. 結果は **Excel (.xlsx) または CSV** でダウンロードできます\n\n"
+        "🛡️ アップロードしたファイルは、サーバー側の一時メモリに"
+        "置かれるだけで、PC 内の元ファイルには一切影響しません。"
     )
     st.markdown("#### 機能ガイド")
     st.markdown(
         "- 📅 **対象月**：サイドバーで YYYY-MM 形式で入力\n"
+        "- 📤 **ファイルアップロード**：シフト Excel と CSV をブラウザから直接\n"
+        "- 👥 **ヘルプ要員選択**：各院タブで「他院へ出せるスタッフ」を選択\n"
         "- ▶ **分析実行**：プライマリーボタン（青色）でワンクリック\n"
-        "- 🏢 **院名クリック**：各院の名前を押すとシフト表のExcelが直接開きます\n"
-        "- 📂 **データソース**：G:\\マイドライブ\\シフト最適化プロジェクト を優先参照、"
-        "見つからなければスクリプトと同じフォルダから取得します"
+        "- 📥 **結果ダウンロード**：Excel（複数シート）または CSV（個別）"
     )
