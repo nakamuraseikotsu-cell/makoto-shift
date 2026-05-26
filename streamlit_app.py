@@ -1636,16 +1636,13 @@ with st.expander(
     elif st.session_state['active_clinic_tab'] not in clinic_order:
         st.session_state['active_clinic_tab'] = clinic_order[0]
 
-    # ラジオラベル: 選択数を併記（クリック対象は安定する: 選択数が変わっても
-    # 同じ「院名」キーで session_state にバインドされるため active 維持される）
+    # ★ 重要: ラジオの format_func は **動的な値を含めない** こと。
+    #   選択数 (N) を含めると rerun のたびにラベル文字列が変わり、Streamlit
+    #   の options.index(format_func(value)) 探索が失敗してタブが先頭にリセット
+    #   される（武蔵小金井・小金井坂下・人形町などで顕著だった）。
+    #   選択数は別のサマリ行で表示することで、ラベルを完全に安定化する。
     def _clinic_label(c: str) -> str:
-        # 防御的に session_state から取得（widget callback 中にも呼ばれるため）
-        val = st.session_state.get(f'ms_help_{c}')
-        if val is None:
-            wl = st.session_state.get(whitelist_state_key) or {}
-            val = wl.get(c) or []
-        n = len(val or [])
-        return f"🏢 {c}" + (f" ({n})" if n else "")
+        return f"🏢 {c}"
 
     active_clinic = st.radio(
         "院を選択（タブ操作）",
@@ -1655,6 +1652,20 @@ with st.expander(
         key='active_clinic_tab',
         label_visibility='collapsed',
     )
+
+    # 各院の選択中人数を可視化する 1 行サマリ（ラジオラベルとは別管理）
+    _count_summary_parts = []
+    for c in clinic_order:
+        val = st.session_state.get(f'ms_help_{c}')
+        if val is None:
+            wl = st.session_state.get(whitelist_state_key) or {}
+            val = wl.get(c) or []
+        n = len(val or [])
+        if n > 0:
+            _count_summary_parts.append(f"**{c}** {n}名")
+        else:
+            _count_summary_parts.append(f"{c} —")
+    st.caption("👥 選択中: " + " ／ ".join(_count_summary_parts))
 
     # ----- 表示は active_clinic の1院ぶんのみ -----
     # 他の院の選択値は session_state にウィジェットキー (ms_help_<院>) として
