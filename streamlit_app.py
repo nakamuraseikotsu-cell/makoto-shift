@@ -1622,74 +1622,110 @@ with st.expander(
     if whitelist_state_key not in st.session_state:
         st.session_state[whitelist_state_key] = {}
 
-    # 5院ぶんを st.tabs に分割（モバイルでもタップで切替・スクロール最小）
     clinic_order = list(CLINIC_FILE_PREFIX.keys())
-    # タブラベル: 現在の選択中人数を併記して状況を一目で把握
-    tab_labels: list[str] = []
-    for c in clinic_order:
-        n_sel = len(st.session_state[whitelist_state_key].get(c, []) or [])
-        tab_labels.append(f"🏢 {c}" + (f" ({n_sel})" if n_sel else ""))
 
-    tabs = st.tabs(tab_labels)
+    # -----------------------------------------------------------------
+    # ★ st.tabs ではなく st.radio (horizontal) で「擬似タブ」を実装する。
+    #   理由: st.tabs はラベル変更や rerun でアクティブタブが先頭にリセット
+    #   される問題があるため、session_state で確実に保持できる radio を使う。
+    #   選択中院の選択肢数(N)はラジオラベル内ではなく、選択後にカード内で
+    #   表示することで、ラベル変化によるさらなる再描画リセットも防止する。
+    # -----------------------------------------------------------------
+    if 'active_clinic_tab' not in st.session_state:
+        st.session_state['active_clinic_tab'] = clinic_order[0]
+    elif st.session_state['active_clinic_tab'] not in clinic_order:
+        st.session_state['active_clinic_tab'] = clinic_order[0]
+
+    # ラジオラベル: 選択数を併記（クリック対象は安定する: 選択数が変わっても
+    # 同じ「院名」キーで session_state にバインドされるため active 維持される）
+    def _clinic_label(c: str) -> str:
+        # 防御的に session_state から取得（widget callback 中にも呼ばれるため）
+        val = st.session_state.get(f'ms_help_{c}')
+        if val is None:
+            wl = st.session_state.get(whitelist_state_key) or {}
+            val = wl.get(c) or []
+        n = len(val or [])
+        return f"🏢 {c}" + (f" ({n})" if n else "")
+
+    active_clinic = st.radio(
+        "院を選択（タブ操作）",
+        options=clinic_order,
+        format_func=_clinic_label,
+        horizontal=True,
+        key='active_clinic_tab',
+        label_visibility='collapsed',
+    )
+
+    # ----- 表示は active_clinic の1院ぶんのみ -----
+    # 他の院の選択値は session_state にウィジェットキー (ms_help_<院>) として
+    # 保持されているため、ここで再レンダーしなくても消えない。
     new_whitelist: dict[str, list[str]] = {}
+    for c in clinic_order:
+        if c == active_clinic:
+            continue  # 下のブロックで描画
+        # アクティブ外の院: 既存セッション値を引き継ぐ
+        new_whitelist[c] = (
+            st.session_state.get(f'ms_help_{c}')
+            or st.session_state[whitelist_state_key].get(c)
+            or []
+        )
 
-    for clinic, tab in zip(clinic_order, tabs):
-        with tab:
-            staff_options = rosters_for_ui.get(clinic, [])
-            immov_for_clinic = IMMOVABLE_STAFF.get(clinic, [])
+    clinic = active_clinic
+    staff_options = rosters_for_ui.get(clinic, [])
+    immov_for_clinic = IMMOVABLE_STAFF.get(clinic, [])
 
-            # 既定: 動かせないスタッフ (IMMOVABLE_STAFF) 以外は全員チェック
-            default_selected = [
-                n for n in staff_options
-                if not any(s in n for s in immov_for_clinic)
-            ]
-            # 既存選択があればそれを優先（options 内のものだけ残す）
-            existing = st.session_state[whitelist_state_key].get(clinic)
-            if existing is not None:
-                preset = [n for n in existing if n in staff_options]
-            else:
-                preset = default_selected
+    # 既定: 動かせないスタッフ (IMMOVABLE_STAFF) 以外は全員チェック
+    default_selected = [
+        n for n in staff_options
+        if not any(s in n for s in immov_for_clinic)
+    ]
+    existing = st.session_state[whitelist_state_key].get(clinic)
+    if existing is not None:
+        preset = [n for n in existing if n in staff_options]
+    else:
+        preset = default_selected
 
-            st.caption(
-                f"**{clinic}**  ／  候補スタッフ: **{len(staff_options)}** 名"
-                + (
-                    f"  ／  自院固定 (既定除外): {', '.join(immov_for_clinic)}"
-                    if immov_for_clinic else ""
-                )
+    with st.container(border=True):
+        st.caption(
+            f"**{clinic}**  ／  候補スタッフ: **{len(staff_options)}** 名"
+            + (
+                f"  ／  自院固定 (既定除外): {', '.join(immov_for_clinic)}"
+                if immov_for_clinic else ""
             )
+        )
 
-            sel = st.multiselect(
-                "他院へヘルプに出せるスタッフ",
-                options=staff_options,
-                default=preset,
-                key=f'ms_help_{clinic}',
-                help=(
-                    f"{clinic} の中で、他院へヘルプに出せるスタッフを"
-                    f"選択してください。"
-                ),
-                placeholder=(
-                    "名簿未取得 — 上の「📋 名簿を取得」を押してください"
-                    if not staff_options else "ヘルプ要員を選択"
-                ),
-                label_visibility="visible",
+        sel = st.multiselect(
+            "他院へヘルプに出せるスタッフ",
+            options=staff_options,
+            default=preset,
+            key=f'ms_help_{clinic}',
+            help=(
+                f"{clinic} の中で、他院へヘルプに出せるスタッフを"
+                f"選択してください。"
+            ),
+            placeholder=(
+                "名簿未取得 — 上の「📋 名簿を取得」を押してください"
+                if not staff_options else "ヘルプ要員を選択"
+            ),
+            label_visibility="visible",
+        )
+        new_whitelist[clinic] = sel
+
+        # フィードバック
+        if staff_options:
+            excluded = [n for n in staff_options if n not in sel]
+            st.markdown(
+                f"✅ ヘルプ可: **{len(sel)} 名** ／ "
+                f"🚫 ヘルプ不可: **{len(excluded)} 名**"
             )
-            new_whitelist[clinic] = sel
-
-            # フィードバック
-            if staff_options:
-                excluded = [n for n in staff_options if n not in sel]
-                st.markdown(
-                    f"✅ ヘルプ可: **{len(sel)} 名** ／ "
-                    f"🚫 ヘルプ不可: **{len(excluded)} 名**"
-                )
-                if excluded:
-                    with st.expander(
-                        f"🚫 ヘルプから除外されるスタッフ ({len(excluded)} 名)",
-                        expanded=False,
-                    ):
-                        st.markdown(
-                            "・" + "  ／  ".join(f"`{n}`" for n in excluded)
-                        )
+            if excluded:
+                with st.expander(
+                    f"🚫 ヘルプから除外されるスタッフ ({len(excluded)} 名)",
+                    expanded=False,
+                ):
+                    st.markdown(
+                        "・" + "  ／  ".join(f"`{n}`" for n in excluded)
+                    )
 
     # 状態を保存（次回 analyze 時に compute_real_shortages へ渡される）
     st.session_state[whitelist_state_key] = new_whitelist
