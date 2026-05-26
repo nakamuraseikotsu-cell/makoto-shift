@@ -38,6 +38,19 @@ from shift_optimizer.src.constants import IMMOVABLE_STAFF  # noqa: E402
 # ==========================================
 # 設定
 # ==========================================
+# デフォルトデータディレクトリ
+# -----------------------------------------------------------------------------
+# スクリプトと同じフォルダに以下のファイル名で配置されていれば、
+# アプリ起動時に自動でセッション temp dir へコピーされて読み込まれる。
+# アップロードがあればそちらが優先（同名ファイルは上書きされる）。
+#   - ultimate_shift_master.csv  （統合マスタ）
+#   - final_analysis_data.csv    （CRM データ）
+#   - 【○○】*.xlsx               （5院ぶんのシフト表）
+# -----------------------------------------------------------------------------
+DEFAULT_DATA_DIR = _SCRIPT_DIR
+DEFAULT_MASTER_CSV = 'ultimate_shift_master.csv'
+DEFAULT_CRM_CSV = 'final_analysis_data.csv'
+
 # 1日あたりの施術対応枠（人）
 CAPACITY_PER_DAY = {
     "国分寺": 12,
@@ -443,10 +456,15 @@ def sync_uploads_to_tempdir(
     master_upload,
     crm_upload,
 ) -> dict:
-    """アップロードを temp dir に同期する。既に書き出し済みならスキップ。"""
+    """アップロードを temp dir に同期する。既に書き出し済みならスキップ。
+
+    アップロードされたファイルが同じ院のデフォルトファイル（事前に seed 済み）
+    を上書きできるよう、対象院の既存 xlsx は削除してから新版を書き出す。
+    """
     tmpdir = Path(get_data_folder())
     tmpdir.mkdir(parents=True, exist_ok=True)
     written_ids = st.session_state.setdefault('_written_file_ids', set())
+    overridden = st.session_state.setdefault('_default_overridden', {})
 
     status: dict = {'shifts': [], 'master': None, 'crm': None}
 
@@ -454,11 +472,22 @@ def sync_uploads_to_tempdir(
 
     for uf in (shift_uploads or []):
         fid = _file_id_of(uf)
+        area = detect_area_from_filename(uf.name)
+        # 上書き: 同院の既存 xlsx（デフォルト seed や前回アップロード）を削除
+        if area:
+            prefix = CLINIC_FILE_PREFIX.get(area)
+            if prefix:
+                for existing in tmpdir.glob(f'{prefix}*.xlsx'):
+                    if existing.name != uf.name:
+                        try:
+                            existing.unlink()
+                        except Exception:
+                            pass
+            overridden[area] = True
         target = tmpdir / uf.name
         if fid not in written_ids or not target.exists():
             target.write_bytes(uf.getbuffer())
             written_ids.add(fid)
-        area = detect_area_from_filename(uf.name)
         status['shifts'].append({
             'name': uf.name, 'area': area,
             'size': uf.size, 'path': str(target),
@@ -466,25 +495,115 @@ def sync_uploads_to_tempdir(
 
     if master_upload is not None:
         fid = _file_id_of(master_upload)
-        target = tmpdir / 'ultimate_shift_master.csv'
+        target = tmpdir / DEFAULT_MASTER_CSV
         if fid not in written_ids or not target.exists():
             target.write_bytes(master_upload.getbuffer())
             written_ids.add(fid)
+        overridden[DEFAULT_MASTER_CSV] = True
         status['master'] = {'name': master_upload.name,
                             'size': master_upload.size,
                             'path': str(target)}
 
     if crm_upload is not None:
         fid = _file_id_of(crm_upload)
-        target = tmpdir / 'final_analysis_data.csv'
+        target = tmpdir / DEFAULT_CRM_CSV
         if fid not in written_ids or not target.exists():
             target.write_bytes(crm_upload.getbuffer())
             written_ids.add(fid)
+        overridden[DEFAULT_CRM_CSV] = True
         status['crm'] = {'name': crm_upload.name,
                          'size': crm_upload.size,
                          'path': str(target)}
 
     return status
+
+
+# =============================================================================
+# デフォルトデータの自動 seed
+# -----------------------------------------------------------------------------
+# スクリプトと同じフォルダ (DEFAULT_DATA_DIR) に配置された固定ファイルを
+# セッション temp dir へコピーする。既にアップロード版がある場合は触らない。
+# 一度 seed したら session_state にフラグを立て、同セッション内で再 seed しない。
+# =============================================================================
+def seed_defaults_if_present() -> dict:
+    """DEFAULT_DATA_DIR からデフォルトファイルを temp dir へコピーする。
+
+    戻り値: {
+        'master': 'default' | 'uploaded' | 'absent',
+        'crm':    'default' | 'uploaded' | 'absent',
+        'shifts': {clinic: 'default' | 'uploaded' | 'absent', ...},
+        'seeded': bool,  # 今回 seed を実行したかどうか
+    }
+    """
+    tmpdir = Path(get_data_folder())
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    # 同セッションで2回目以降は seed をスキップ（ステータスのみ返す）
+    already = st.session_state.get('_defaults_seeded', False)
+
+    status: dict = {'master': 'absent', 'crm': 'absent',
+                    'shifts': {c: 'absent' for c in CLINIC_FILE_PREFIX},
+                    'seeded': False}
+
+    def _seed_one(default_name: str, target_name: str | None = None) -> str:
+        """1ファイルだけseed。戻り値 = 'default'/'uploaded'/'absent'"""
+        target_name = target_name or default_name
+        src = DEFAULT_DATA_DIR / default_name
+        dst = tmpdir / target_name
+        if dst.exists() and st.session_state.get('_default_overridden', {}).get(target_name):
+            return 'uploaded'
+        if dst.exists() and not src.exists():
+            # アップロードされた版（seed ソースが無いので uploaded 判定）
+            return 'uploaded'
+        if dst.exists() and src.exists() and not already:
+            # 既に seed 済みの可能性。mtime で確認
+            return 'default'
+        if not src.exists():
+            return 'absent'
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            status['seeded'] = True
+            return 'default'
+        return 'default'
+
+    # マスタCSV / CRMの seed
+    status['master'] = _seed_one(DEFAULT_MASTER_CSV)
+    status['crm'] = _seed_one(DEFAULT_CRM_CSV)
+
+    # シフト xlsx の seed (各院ごとにプレフィックス検索)
+    for clinic, prefix in CLINIC_FILE_PREFIX.items():
+        existing_in_tmp = sorted(tmpdir.glob(f'{prefix}*.xlsx'))
+        if existing_in_tmp:
+            # 既にあるならアップロード版か seed 済みか
+            # _default_overridden フラグでアップロードか判定（簡易）
+            overridden = st.session_state.get('_default_overridden', {}).get(clinic)
+            status['shifts'][clinic] = 'uploaded' if overridden else 'default'
+            continue
+        # デフォルトを探す
+        defaults = sorted(DEFAULT_DATA_DIR.glob(f'{prefix}*.xlsx'))
+        if not defaults:
+            status['shifts'][clinic] = 'absent'
+            continue
+        # 「シフト」を含むものを優先
+        pick = next((p for p in defaults if 'シフト' in p.name), defaults[0])
+        try:
+            shutil.copy2(pick, tmpdir / pick.name)
+            status['shifts'][clinic] = 'default'
+            status['seeded'] = True
+        except Exception:
+            status['shifts'][clinic] = 'absent'
+
+    st.session_state['_defaults_seeded'] = True
+    return status
+
+
+def _src_badge(src: str) -> str:
+    """読み込み元 (default/uploaded/absent) を絵文字バッジで表示する。"""
+    return {
+        'default': '🟢 デフォルト',
+        'uploaded': '🔵 アップロード上書き',
+        'absent': '⬜ 未読み込み',
+    }.get(src, '⬜ 未読み込み')
 
 
 def _whitelist_to_key(wl: dict | None) -> tuple | None:
@@ -857,32 +976,76 @@ def render_schedule_alert(today: _date | None = None) -> None:
 # ==========================================
 # サイドバー
 # ==========================================
-# 現在のアップロード状況をサイドバーに集約表示
-data_folder = get_data_folder()
-_status_shifts = []
-for _c in CLINIC_FILE_PREFIX:
-    _x = find_shift_xlsx(_c)
-    _status_shifts.append((_c, bool(_x and _x.exists())))
-_uploaded_n = sum(1 for _, ok in _status_shifts if ok)
-_master_ok = (Path(data_folder) / 'ultimate_shift_master.csv').exists()
-_crm_ok = (Path(data_folder) / 'final_analysis_data.csv').exists()
+# --- セッション起動時にデフォルトファイルを temp dir へ seed する ---
+_seed_status = seed_defaults_if_present()
+st.session_state['_seed_status_cache'] = _seed_status
+if _seed_status.get('seeded'):
+    # 初回 seed 時のみトースト
+    n_seeded_shifts = sum(1 for v in _seed_status['shifts'].values() if v == 'default')
+    msg_parts = []
+    if _seed_status['master'] == 'default':
+        msg_parts.append("マスタCSV")
+    if _seed_status['crm'] == 'default':
+        msg_parts.append("CRM CSV")
+    if n_seeded_shifts:
+        msg_parts.append(f"シフト{n_seeded_shifts}院")
+    if msg_parts:
+        st.toast(
+            f"📥 デフォルトデータを自動読込: {' / '.join(msg_parts)}",
+            icon="✅",
+        )
 
-st.sidebar.header("📤 アップロード状況")
-if _uploaded_n == 0 and not _master_ok:
-    st.sidebar.info(
-        "ファイル未アップロード\n\n"
-        "メイン画面の **「📤 ファイルをアップロード」** "
-        "セクションでシフト表を選択してください。"
-    )
-else:
-    for clinic, ok in _status_shifts:
-        st.sidebar.caption(f"{'✅' if ok else '⬜'} {clinic}")
-    st.sidebar.caption(
-        f"{'✅' if _master_ok else '⬜'} ultimate_shift_master.csv"
-    )
-    st.sidebar.caption(
-        f"{'✅' if _crm_ok else '⬜'} final_analysis_data.csv (任意)"
-    )
+# ---- アップロード (上書き用) ----
+st.sidebar.header("📤 ファイルをアップロード（上書き用）")
+st.sidebar.info(
+    "🛡️ **元のファイルは消えません/上書きされません。**\n\n"
+    "リポジトリ内のデフォルトファイルがあれば自動読込されます。"
+    "ここからアップロードした場合のみ、その分を **一時的に上書き** します。"
+)
+
+shift_uploads = st.sidebar.file_uploader(
+    "🗓 シフト表 Excel（5院ぶん）",
+    type=['xlsx'],
+    accept_multiple_files=True,
+    key='upload_shifts',
+    help=(
+        "ファイル名の先頭が「【国分寺】」「【武蔵小金井】」「【東小金井】」"
+        "「【坂下】」「【人形町】」のいずれかである .xlsx をまとめてドロップしてください。"
+    ),
+)
+master_upload = st.sidebar.file_uploader(
+    "📊 マスター CSV (任意)",
+    type=['csv'],
+    key='upload_master',
+    help="ultimate_shift_master.csv — デフォルトを一時的に差し替えたい場合",
+)
+crm_upload = st.sidebar.file_uploader(
+    "💰 CRM 売上 CSV (任意)",
+    type=['csv'],
+    key='upload_crm',
+    help="final_analysis_data.csv — デフォルトを一時的に差し替えたい場合",
+)
+
+# アップロードを temp dir に書き出し（同院の seed 済 xlsx は削除して上書き）
+_upload_status = sync_uploads_to_tempdir(
+    shift_uploads, master_upload, crm_upload,
+)
+
+# アップロード後に seed status を再評価して画面側へ反映
+_seed_status = seed_defaults_if_present()
+st.session_state['_seed_status_cache'] = _seed_status
+
+# サイドバー: 現在の読込状況（コンパクト表示）
+st.sidebar.divider()
+st.sidebar.markdown("**📋 現在の読込状況**")
+for c in CLINIC_FILE_PREFIX:
+    st.sidebar.caption(f"{_src_badge(_seed_status['shifts'].get(c, 'absent'))} {c}")
+st.sidebar.caption(
+    f"{_src_badge(_seed_status['master'])} マスタ CSV"
+)
+st.sidebar.caption(
+    f"{_src_badge(_seed_status['crm'])} CRM CSV"
+)
 
 st.sidebar.divider()
 st.sidebar.markdown("### 📅 対象月を選択")
@@ -1069,84 +1232,33 @@ st.divider()
 # ★ 重要: アップロードされたファイルは **サーバの一時ディレクトリにのみ**
 #   保存され、元のローカルファイルには一切影響しない。
 # =====================================================================
+# =====================================================================
+# データ読み込み状況パネル（メイン画面・簡潔表示）
+# ---------------------------------------------------------------------
+#  サイドバーで一時ファイルをアップロードした場合はそちらを優先表示し、
+#  なければ DEFAULT_DATA_DIR のデフォルトファイルが自動使用される。
+# =====================================================================
+seed_status = st.session_state.get('_seed_status_cache', {})
+
+
 with st.container(border=True):
-    st.markdown("### 📤 ファイルをアップロード")
+    st.markdown("### 📊 データ読み込み状況")
+    sub_cols = st.columns(7)
+    sub_cols[0].caption("**マスタ CSV**")
+    sub_cols[0].markdown(_src_badge(seed_status.get('master', 'absent')))
+    sub_cols[1].caption("**CRM CSV**")
+    sub_cols[1].markdown(_src_badge(seed_status.get('crm', 'absent')))
+    shift_status = seed_status.get('shifts', {}) or {}
+    for i, clinic in enumerate(CLINIC_FILE_PREFIX):
+        sub_cols[i + 2].caption(f"**{clinic}**")
+        sub_cols[i + 2].markdown(_src_badge(shift_status.get(clinic, 'absent')))
 
-    # 安心メッセージ（常時可視・大きめ）
-    st.info(
-        "ℹ️ **ここにファイルをドロップしても、元のファイルが消えたり"
-        "上書きされることはありませんのでご安心ください。**\n\n"
-        "アップロードされたファイルはサーバ側の一時メモリに置かれ、"
-        "ブラウザを閉じると自動的に破棄されます。"
-        "PC 内の元ファイルは一切変更されません。",
-        icon="🛡️",
+    # 凡例
+    st.caption(
+        "凡例: 🟢 リポジトリ内のデフォルトファイル使用 ／ "
+        "🔵 サイドバーでアップロードされたファイルで上書き中 ／ "
+        "⬜ 未読み込み（サイドバーからアップロードしてください）"
     )
-
-    upload_col1, upload_col2 = st.columns([2, 1])
-
-    with upload_col1:
-        shift_uploads = st.file_uploader(
-            "**🗓 シフト表 Excel（5院ぶん）**",
-            type=['xlsx'],
-            accept_multiple_files=True,
-            key='upload_shifts',
-            help=(
-                "ファイル名の先頭が「【国分寺】」「【武蔵小金井】」"
-                "「【東小金井】」「【坂下】」「【人形町】」のいずれかである "
-                ".xlsx ファイルをまとめてドロップしてください。"
-            ),
-        )
-
-        sub_col1, sub_col2 = st.columns(2)
-        with sub_col1:
-            master_upload = st.file_uploader(
-                "**📊 マスター CSV** (必須)",
-                type=['csv'],
-                key='upload_master',
-                help=(
-                    "ultimate_shift_master.csv（過去患者・天気・"
-                    "スタッフ実績の集計データ）"
-                ),
-            )
-        with sub_col2:
-            crm_upload = st.file_uploader(
-                "**💰 CRM 売上 CSV** (任意)",
-                type=['csv'],
-                key='upload_crm',
-                help=(
-                    "final_analysis_data.csv（院別の客単価算出に使用）。"
-                    "未指定なら一律 ¥6,000 で計算します。"
-                ),
-            )
-
-    # アップロードを temp dir に書き出し
-    upload_status = sync_uploads_to_tempdir(
-        shift_uploads, master_upload, crm_upload,
-    )
-
-    with upload_col2:
-        st.markdown("**📋 認識状況**")
-        # 各院の認識結果
-        clinic_status_lines = []
-        recognized = {s['area']: s for s in upload_status['shifts'] if s['area']}
-        unrecognized = [s for s in upload_status['shifts'] if not s['area']]
-        for clinic in CLINIC_FILE_PREFIX:
-            if clinic in recognized:
-                clinic_status_lines.append(f"✅ **{clinic}**")
-            else:
-                clinic_status_lines.append(f"⬜ {clinic}")
-        clinic_status_lines.append(
-            f"{'✅' if upload_status['master'] else '⬜'} master CSV"
-        )
-        clinic_status_lines.append(
-            f"{'✅' if upload_status['crm'] else '⬜'} CRM CSV (任意)"
-        )
-        for line in clinic_status_lines:
-            st.markdown(f"- {line}")
-        if unrecognized:
-            st.caption(
-                f"⚠ プレフィックス未認識: {', '.join(s['name'] for s in unrecognized)}"
-            )
 
 st.divider()
 
